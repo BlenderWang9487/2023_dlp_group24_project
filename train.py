@@ -1,3 +1,4 @@
+from typing import List, Optional, Tuple, Union
 from dataclasses import dataclass
 from diffusers import DDPMScheduler
 from torchvision import transforms, datasets
@@ -5,7 +6,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from diffusers.optimization import get_cosine_schedule_with_warmup
-from model.my_diffusers import MyDDPMPipeline, MyUNet2DConditionModel
+from model.my_diffusers import MyDDPMPipeline, MyUNet2DConditionModel, MyUNet2DModel
 import torch
 from torchvision.utils import make_grid, save_image
 
@@ -21,19 +22,21 @@ import numpy as np
 class TrainingConfig:
     image_size = 32
     uncond_prob = 0.1
-    # train_batch_size = 64
-    train_batch_size = 16
+    train_batch_size = 64
+    # train_batch_size = 16
     eval_batch_size = 10
     num_epochs = 200
     # num_epochs = 70
-    gradient_accumulation_steps = 4
+    # gradient_accumulation_steps = 4
+    gradient_accumulation_steps = 1
     learning_rate = 1e-4
     lr_warmup_steps = 500
     save_image_epochs = 5
     save_model_epochs = 10
     mixed_precision = "fp16"
-    output_dir = "ckpt/cifar10"
-    num_workers = 3
+    # output_dir = "ckpt/cifar10/0530"
+    output_dir = "ckpt/cifar10/0531"
+    num_workers = 6
     device = 'cuda'
     scheduler_type = 'squaredcos_cap_v2'
 
@@ -109,28 +112,36 @@ def Train():
         num_workers=config.num_workers,
         pin_memory=True)
 
-    model = MyUNet2DConditionModel(
+    # model = MyUNet2DConditionModel(
+    #     sample_size=config.image_size,  # the target image resolution
+    #     in_channels=3,  # the number of input channels, 3 for RGB images
+    #     out_channels=3,  # the number of output channels
+    #     layers_per_block=2,  # how many ResNet layers to use per UNet block
+    #     block_out_channels=(128, 128, 256, 256, 512),  # the number of output channels for each UNet block
+    #     down_block_types=(
+    #         "DownBlock2D",  # a regular ResNet downsampling block
+    #         "DownBlock2D",
+    #         "DownBlock2D",
+    #         "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
+    #         "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
+    #         # "DownBlock2D",
+    #     ),
+    #     up_block_types=(
+    #         # "UpBlock2D",  # a regular ResNet upsampling block
+    #         "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
+    #         "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
+    #         "UpBlock2D",
+    #         "UpBlock2D",
+    #         "UpBlock2D",
+    #     ),
+    #     num_class_embeds=10,
+    #     cross_attention_dim=512
+    # )
+    model = MyUNet2DModel(
         sample_size=config.image_size,  # the target image resolution
         in_channels=3,  # the number of input channels, 3 for RGB images
         out_channels=3,  # the number of output channels
-        layers_per_block=2,  # how many ResNet layers to use per UNet block
-        block_out_channels=(128, 128, 256, 256, 512),  # the number of output channels for each UNet block
-        down_block_types=(
-            "DownBlock2D",  # a regular ResNet downsampling block
-            "DownBlock2D",
-            "DownBlock2D",
-            "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
-            "DownBlock2D",
-        ),
-        up_block_types=(
-            "UpBlock2D",  # a regular ResNet upsampling block
-            "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
-            "UpBlock2D",
-            "UpBlock2D",
-            "UpBlock2D",
-        ),
         num_class_embeds=10,
-        cross_attention_dim=512
     )
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule=config.scheduler_type)
 
@@ -144,7 +155,7 @@ def Train():
 
     def train_loop(
             config: TrainingConfig,
-            model: MyUNet2DConditionModel,
+            model: Union[MyUNet2DConditionModel, MyUNet2DModel],
             noise_scheduler: DDPMScheduler,
             optimizer: torch.optim.AdamW,
             train_dataloader: DataLoader,
@@ -192,11 +203,12 @@ def Train():
 
                 with accelerator.accumulate(model):
                     # Predict the noise residual
-                    noise_pred = model(noisy_images, timesteps, None, class_labels=cond_labels, return_dict=False)[0]
+                    noise_pred = model(noisy_images, timesteps, class_labels=cond_labels, return_dict=False)[0]
                     loss = criterion(noise_pred, noise)
                     accelerator.backward(loss)
-
-                    # accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    # if accelerator.sync_gradients:
+                    #     accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
