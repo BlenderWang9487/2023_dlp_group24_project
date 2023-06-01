@@ -1,3 +1,6 @@
 .DS_Store
 __pycache__/
 classify_image_graph_def.pb
+patch_diffusion.egg-info/
+models/
+results/
