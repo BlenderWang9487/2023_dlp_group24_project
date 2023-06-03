@@ -43,6 +43,7 @@ class MyDoubleDDPMPipeline(DiffusionPipeline):
         self,
         batch_size: int = 1,
         condition: Optional[torch.Tensor] = None,
+        condition_alternative: Optional[torch.Tensor] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         cfg_scale: Optional[float] = None,
         num_inference_steps: int = 1000,
@@ -93,7 +94,8 @@ class MyDoubleDDPMPipeline(DiffusionPipeline):
             # 1. predict noise model_output
             t = t.to(self.my_device)
             ratios = ratio_scheduler.get_ratio(t=t)
-            model_output = double_unet(image, t, ratio=ratios, class_labels=condition.float()).sample
+            model_output = double_unet(image, t, ratio=ratios, class_labels=condition.float(),
+                                        class_labels_alternateive=condition_alternative.float() if condition_alternative is not None else None).sample
             if cfg_scale is not None: # classifier free guidance
                 uncond_output = double_unet(image, t, ratio=ratios, class_labels=None).sample
                 model_output = torch.lerp(uncond_output, model_output, cfg_scale)
@@ -147,13 +149,14 @@ class DoubleUnet(nn.Module):
         timestep: Union[torch.Tensor, float, int],
         ratio: Union[torch.Tensor, float],
         class_labels: Optional[torch.Tensor] = None,
+        class_labels_alternateive: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> Union[UNet2DOutput, Tuple]:
         
         pred_1 = self.expert_unet_1(
             sample = sample, timestep = timestep, class_labels = class_labels, return_dict=False)
         pred_2 = self.expert_unet_2(
-            sample = sample, timestep = timestep, class_labels = class_labels, return_dict=False)
+            sample = sample, timestep = timestep, class_labels = class_labels if class_labels_alternateive is None else class_labels_alternateive, return_dict=False)
         
         pred = pred_1[0] * ratio + pred_2[0] * (1. - ratio)
 
