@@ -36,6 +36,7 @@ class TrainingConfig:
     output_dir = "ckpt/cifar10/0602/double"
     # unet_pretrained = "ckpt/cifar10/0601/unet"
     unet_pretrained = "ckpt/cifar10/init_model"
+    unet_pretrained2 = "ckpt/cifar10/init_model_2"
     num_workers = 4
     device = 'cuda'
     scheduler_type = 'squaredcos_cap_v2'
@@ -121,7 +122,7 @@ def Train():
         num_workers=config.num_workers,
         pin_memory=True)
 
-    model = DoubleUnet.from_unet_pretrained(config.unet_pretrained)
+    model = DoubleUnet.from_unet_pretrained(config.unet_pretrained, config.unet_pretrained2)
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule=config.scheduler_type)
     ratio_scheduler = DoubleDenoisingRatioScheduler(time_steps=1000)
 

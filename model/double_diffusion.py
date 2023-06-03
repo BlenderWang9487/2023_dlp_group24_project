@@ -126,9 +126,11 @@ class DoubleUnet(nn.Module):
         return DoubleUnet(unet_1, unet_2)
     
     @staticmethod
-    def from_unet_pretrained(pretrained_dir: str):
+    def from_unet_pretrained(pretrained_dir: str, pretrained_dir2 = None):
+        if pretrained_dir2 is None:
+            pretrained_dir2 = pretrained_dir
         unet_1 = MyUNet2DModel.from_pretrained(pretrained_dir)
-        unet_2 = MyUNet2DModel.from_pretrained(pretrained_dir)
+        unet_2 = MyUNet2DModel.from_pretrained(pretrained_dir2)
 
         return DoubleUnet(unet_1, unet_2)
     
