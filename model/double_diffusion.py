@@ -2,24 +2,41 @@ from .my_diffusers import *
 import pathlib as pl
 
 class DoubleDenoisingRatioScheduler(nn.Module):
-    def __init__(self, ratio_type = 'linear', time_steps = 1000, start_r = 0., end_r = 1.) -> None:
+    def __init__(
+            self,
+            ratio_type = 'linear',
+            time_steps = 1000,
+            start_r = 0.,
+            end_r = 1.,
+            start_s = -15.,
+            end_s = 5.,
+            time_proj_size = 256,
+            time_emb_size = 256,
+        ) -> None:
         super().__init__()
 
         # ratio is for the 'expert_unet_1' at timestep t
+        self.ratio_type = ratio_type
         if ratio_type == 'linear':
             self.register_buffer('ratio', torch.linspace(start_r, end_r, steps=time_steps))
+        elif ratio_type == 'sigmoid':
+            self.register_buffer('ratio', torch.sigmoid(torch.linspace(start_s, end_s, steps=time_steps)))
+        elif ratio_type == 'learned':
+            self.ratio = nn.Sequential(
+                Timesteps(time_proj_size, True, 0),
+                TimestepEmbedding(time_proj_size, time_emb_size, out_dim=1),
+                nn.Sigmoid()
+            )
         else:
             raise NotImplementedError()
         
     def get_ratio(self, t: torch.Tensor, batch=False):
         if batch:
-            if t.dim() == 1:
-                return self.ratio[t][:, None, None, None]
-            elif t.dim() == 2:
-                return self.ratio[t][:, :, None, None]
+            if isinstance(self.ratio, nn.Module): # learned ratio
+                return self.ratio(t.view(-1))[:, :, None, None]
             else:
-                raise RuntimeError()
-        return self.ratio[t]
+                return self.ratio[t.view(-1)][:, :, None, None]
+        return self.ratio[t] if not isinstance(self.ratio, nn.Module) else self.ratio(t.unsqueeze(0)).squeeze()
 
 
 class MyDoubleDDPMPipeline(DiffusionPipeline):

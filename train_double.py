@@ -17,6 +17,7 @@ import os
 import random
 import logging
 import numpy as np
+import matplotlib.pyplot as plt
 
 @dataclass
 class TrainingConfig:
@@ -33,13 +34,18 @@ class TrainingConfig:
     save_image_epochs = 5
     save_model_epochs = 10
     mixed_precision = "fp16"
-    output_dir = "ckpt/cifar10/0602/double"
+    # output_dir = "ckpt/cifar10/0602/double"
+    # output_dir = "ckpt/cifar10/0603/double"
+    output_dir = "ckpt/cifar10/0605/double"
     # unet_pretrained = "ckpt/cifar10/0601/unet"
     unet_pretrained = "ckpt/cifar10/init_model"
     unet_pretrained2 = "ckpt/cifar10/init_model_2"
     num_workers = 4
     device = 'cuda'
     scheduler_type = 'squaredcos_cap_v2'
+    # ratio_scheduler_type = 'linear'
+    # ratio_scheduler_type = 'sigmoid'
+    ratio_scheduler_type = 'learned'
 
     push_to_hub = False
     overwrite_output_dir = True
@@ -79,9 +85,27 @@ def evaluate(
     image_grid = make_grid(images, nrow=10)
 
     # Save the images
-    test_dir = os.path.join(config.output_dir, "samples")
+    test_dir = Path(config.output_dir) / "samples"
 
-    os.makedirs(test_dir, exist_ok=True)
+    # check ratio
+    if ratio_scheduler.ratio_type == 'learned':
+        ratio_dir = Path(config.output_dir) / "ratio"
+        ratio_dir.mkdir(parents=True, exist_ok=True)
+        fig, ax = plt.subplots()
+        fig.set_size_inches(10, 2)
+        t = torch.arange(1000)
+        ratio = ratio_scheduler.get_ratio(t.to(config.device), True).squeeze().cpu().numpy()
+        t = t.numpy()
+        ax.set_ylim(0, 1)
+        ax.fill_between(t, 0, ratio, label='expert1')
+        ax.fill_between(t, ratio, 1, label='expert2')
+        ax.legend()
+        ax.set_xlabel('Timestep')
+        ax.set_ylabel('Ratio (of expert 1)')
+        fig.tight_layout()
+        fig.savefig(ratio_dir / f"{epoch:04d}.png")
+        
+    test_dir.mkdir(parents=True, exist_ok=True)
 
     cfg_prefix = '' if cfg_scale is None else f'cfg{cfg_scale}_'
     save_image(image_grid, f"{test_dir}/{cfg_prefix}{epoch:04d}.png")
@@ -124,9 +148,9 @@ def Train():
 
     model = DoubleUnet.from_unet_pretrained(config.unet_pretrained, config.unet_pretrained2)
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule=config.scheduler_type)
-    ratio_scheduler = DoubleDenoisingRatioScheduler(time_steps=1000)
+    ratio_scheduler = DoubleDenoisingRatioScheduler(ratio_type=config.ratio_scheduler_type, time_steps=1000)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    optimizer = torch.optim.AdamW(list(model.parameters()) + list(ratio_scheduler.parameters()), lr=config.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=config.lr_warmup_steps,
@@ -220,6 +244,8 @@ def Train():
                 if (epoch) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
                     unwap_m: DoubleUnet = accelerator.unwrap_model(model)
                     unwap_m.save_pretrained(config.output_dir)
+                    noise_scheduler.save_pretrained(config.output_dir)
+                    torch.save(accelerator.unwrap_model(ratio_scheduler).state_dict(), Path(config.output_dir) / "ratio_scheduler.pt")
                     logger.info(f"Save epoch#{epoch} model to {str(config.output_dir)}")
 
     train_loop(
