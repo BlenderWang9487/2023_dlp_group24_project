@@ -35,7 +35,7 @@ class DoubleDenoisingRatioScheduler(nn.Module):
             if isinstance(self.ratio, nn.Module): # learned ratio
                 return self.ratio(t.view(-1))[:, :, None, None]
             else:
-                return self.ratio[t.view(-1)][:, :, None, None]
+                return self.ratio[t.view(-1)][:, None, None, None]
         return self.ratio[t] if not isinstance(self.ratio, nn.Module) else self.ratio(t.unsqueeze(0)).squeeze()
 
 
