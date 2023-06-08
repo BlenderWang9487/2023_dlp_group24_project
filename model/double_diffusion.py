@@ -62,6 +62,7 @@ class MyDoubleDDPMPipeline(DiffusionPipeline):
         condition: Optional[torch.Tensor] = None,
         condition_alternative: Optional[torch.Tensor] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        eta: float = 0.,
         cfg_scale: Optional[float] = None,
         num_inference_steps: int = 1000,
         ratio_scheduler = DoubleDenoisingRatioScheduler(),
@@ -89,6 +90,9 @@ class MyDoubleDDPMPipeline(DiffusionPipeline):
             `return_dict` is True, otherwise a `tuple. When returning a tuple, the first element is a list with the
             generated images.
         """
+        use_ddim = isinstance(self.scheduler, DDIMScheduler)
+        if use_ddim:
+            num_inference_steps = 50
 
         # Sample gaussian noise to begin loop
         if isinstance(self.expert_unet_1.sample_size, int):
@@ -118,7 +122,10 @@ class MyDoubleDDPMPipeline(DiffusionPipeline):
                 model_output = torch.lerp(uncond_output, model_output, cfg_scale)
 
             # 2. compute previous image: x_t -> x_t-1
-            image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
+            if use_ddim:
+                image = self.scheduler.step(model_output, t, image, eta=eta, generator=generator).prev_sample
+            else:
+                image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
 
         # image = (image / 2 + 0.5).clamp(0, 1) not unnormalize yet, we need to evaluate
         # image = image.cpu()

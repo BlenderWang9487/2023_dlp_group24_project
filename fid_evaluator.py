@@ -17,7 +17,7 @@ from torch.utils.data.sampler import RandomSampler
 from torchvision.utils import make_grid, save_image
 from torchmetrics.image.fid import FrechetInceptionDistance
 
-from diffusers import DDPMScheduler
+from diffusers import DDPMScheduler, DDIMScheduler
 from model.my_diffusers import MyDDPMPipeline, MyUNet2DModel
 from model.double_diffusion import MyDoubleDDPMPipeline, DoubleDenoisingRatioScheduler, DoubleUnet
 
@@ -37,6 +37,9 @@ def get_args():
     parser.add_argument('--ratio_type', type=str, default='linear', help='ratio scheduler type')
     parser.add_argument('--seed', type=int, default=9487, help='seed for reproduction')
     parser.add_argument('--img_size', type=int, default=64, help='size of the images that model was trained on')
+    parser.add_argument('--use_ddim', action='store_true', help='use DDIM as scheduler to accelerate sampling speed')
+    parser.add_argument('--eta', type=float, default=0.0, help='The eta parameter which controls the scale of the variance (0 is DDIM and 1 is one type of DDPM')
+    parser.add_argument('-o', '--output_img', type=Path, default=None, help='Dir to save imgs sampled, default is ***NOT TO SAVE ANY***')
     return parser.parse_args()
 
 def calculate_fid(
@@ -46,7 +49,10 @@ def calculate_fid(
         sample_count=1000,
         class_num=10,
         device='cpu',
-        seed=None
+        seed=None,
+        eta=0., # if not using DDIM, this will be ignored
+        img_dir: Path=None,
+        ratio_scheduler: DoubleDenoisingRatioScheduler=None
     ):
     fid_model = FrechetInceptionDistance(normalize=True).to(device) # image value is between [0, 1]
     
@@ -75,25 +81,40 @@ def calculate_fid(
             batch_size=cond.shape[0],
             condition=cond,
             generator=gen,
+            eta=eta,
+            ratio_scheduler=ratio_scheduler
         ).images
-        fid_model.update(unnormalize_to_zero_to_one(fake_img), real=False)
+        fake_img = unnormalize_to_zero_to_one(fake_img)
+        fid_model.update(fake_img, real=False)
         step += 1
+
+        updated_images_num = min(step * batch_size, sample_count)
+
+        addition_msg = ""
+        if img_dir is not None:
+            grid = make_grid(fake_img, nrow=16)
+            img_file = img_dir / f"{step:04d}.png"
+            save_image(grid, img_file)
+            addition_msg = f"Saving fake images to {img_file}."
+        print(f"Updated {updated_images_num}/{sample_count} ({updated_images_num/sample_count:%}) fake images. {addition_msg}\n")
 
     return float(fid_model.compute())
 
 
 if __name__ == "__main__":
     args = get_args()
-    noise_scheduler = DDPMScheduler(beta_schedule=args.noise_type)
+    print(f"Args: {args}")
+    noise_scheduler = DDPMScheduler(beta_schedule=args.noise_type) if not args.use_ddim else DDIMScheduler(beta_schedule=args.noise_type)
     if args.single:
         model = MyUNet2DModel.from_pretrained(args.pretrained).to(args.device)
         pipeline = MyDDPMPipeline(unet=model, scheduler=noise_scheduler, device=args.device)
     else:
-        model = DoubleUnet.from_pretrained(args.pretrained)
+        model = DoubleUnet.from_pretrained(args.pretrained).to(args.device)
         ratio_scheduler = DoubleDenoisingRatioScheduler(ratio_type=args.ratio_type)
         if args.ratio_type == 'learned':
             ratio_scheduler.load_state_dict(torch.load(args.pretrained / 'ratio_scheduler.pt'))
-        pipeline = MyDoubleDDPMPipeline(unet1=model.expert_unet_1, unet2=model.expert_unet_2, device=args.device)
+        ratio_scheduler = ratio_scheduler.to(args.device)
+        pipeline = MyDoubleDDPMPipeline(unet1=model.expert_unet_1, unet2=model.expert_unet_2, scheduler=noise_scheduler, device=args.device)
 
     
     preprocess = transforms.Compose([
@@ -114,6 +135,8 @@ if __name__ == "__main__":
         num_workers=4,
         pin_memory=True,
     )
+    if args.output_img is not None:
+        args.output_img.mkdir(parents=True, exist_ok=True)
     fid = calculate_fid(
         eval_loader=eval_loader,
         pipeline=pipeline,
@@ -121,10 +144,12 @@ if __name__ == "__main__":
         sample_count=args.sample_count,
         class_num=4 if args.dataset == 'lsun' else 10,
         device=args.device,
-        seed=args.seed
+        seed=args.seed,
+        eta=args.eta,
+        img_dir=args.output_img,
+        ratio_scheduler=ratio_scheduler if not args.single else None
         )
     print(f"FID: {fid}")
-    print(f"Args: {args}")
 
 
 
