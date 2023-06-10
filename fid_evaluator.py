@@ -18,7 +18,7 @@ from torchvision.utils import make_grid, save_image
 from torchmetrics.image.fid import FrechetInceptionDistance
 
 from diffusers import DDPMScheduler, DDIMScheduler
-from model.my_diffusers import MyDDPMPipeline, MyUNet2DModel
+from model.my_diffusers import MyDDPMPipeline, MyUNet2DModel, MyConditionedUNet
 from model.double_diffusion import MyDoubleDDPMPipeline, DoubleDenoisingRatioScheduler, DoubleUnet
 
 def unnormalize_to_zero_to_one(t):
@@ -40,6 +40,7 @@ def get_args():
     parser.add_argument('--use_ddim', action='store_true', help='use DDIM as scheduler to accelerate sampling speed')
     parser.add_argument('--eta', type=float, default=0.0, help='The eta parameter which controls the scale of the variance (0 is DDIM and 1 is one type of DDPM')
     parser.add_argument('-o', '--output_img', type=Path, default=None, help='Dir to save imgs sampled, default is ***NOT TO SAVE ANY***')
+    parser.add_argument('--big_sister', action='store_true', help='Use big sister model architecture')
     return parser.parse_args()
 
 def calculate_fid(
@@ -106,7 +107,12 @@ if __name__ == "__main__":
     print(f"Args: {args}")
     noise_scheduler = DDPMScheduler(beta_schedule=args.noise_type) if not args.use_ddim else DDIMScheduler(beta_schedule=args.noise_type)
     if args.single:
-        model = MyUNet2DModel.from_pretrained(args.pretrained).to(args.device)
+        pretrain_path = args.pretrained
+        if args.big_sister:
+            model = MyConditionedUNet.from_pretrained(pretrain_path)
+        else:
+            model = MyUNet2DModel.from_pretrained(pretrain_path)
+        model = model.to(args.device)
         pipeline = MyDDPMPipeline(unet=model, scheduler=noise_scheduler, device=args.device)
     else:
         model = DoubleUnet.from_pretrained(args.pretrained).to(args.device)
@@ -150,6 +156,10 @@ if __name__ == "__main__":
         ratio_scheduler=ratio_scheduler if not args.single else None
         )
     print(f"FID: {fid}")
+    if args.output_img is not None:
+        with open(args.output_img / "parametes_and_fid.txt", 'w') as f:
+            f.write(f"Args: {args}\n\n")
+            f.write(f"FID: {fid}\n")
 
 
 

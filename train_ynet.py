@@ -6,7 +6,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from diffusers.optimization import get_cosine_schedule_with_warmup
-from model.double_diffusion import DoubleUnet, MyDoubleDDPMPipeline, DoubleDenoisingRatioScheduler
+from model.my_diffusers import MyDDPMPipeline, MyUNet2DConditionModel, MyUNet2DModel
+from model.double_diffusion import YNet2DModel, YHeadNet2DModel, YNetDDPMPipeline, DoubleDenoisingRatioScheduler
 import torch
 from torchvision.utils import make_grid, save_image
 
@@ -26,30 +27,24 @@ class TrainingConfig:
     train_batch_size = 128
     eval_batch_size = 100
     num_epochs = 200
-    # num_epochs = 30
     gradient_accumulation_steps = 1
     learning_rate = 1e-4
-    # lr_warmup_steps = 391
     lr_warmup_steps = 500
     save_image_epochs = 5
     save_model_epochs = 10
     mixed_precision = "fp16"
-    # output_dir = "ckpt/cifar10/0602/double"
-    # output_dir = "ckpt/cifar10/0603/double"
-    # output_dir = "ckpt/cifar10/0605/double"
-    # output_dir = "ckpt/cifar10/0606/double_halfsize"
-    output_dir = "ckpt/cifar10/0606/double_halfsize_learned"
-    # unet_pretrained = "ckpt/cifar10/0601/unet"
-    # unet_pretrained = "ckpt/cifar10/init_model"
-    # unet_pretrained2 = "ckpt/cifar10/init_model_2"
-    unet_pretrained = "ckpt/cifar10/half/init_model"
-    unet_pretrained2 = "ckpt/cifar10/half/init_model_2"
+    # output_dir = "ckpt/cifar10/0609/ynet"
+    output_dir = "ckpt/cifar10/0610/yheadnet"
     num_workers = 4
     device = 'cuda'
     scheduler_type = 'squaredcos_cap_v2'
+    # scheduler_type = 'linear'
     # ratio_scheduler_type = 'linear'
     # ratio_scheduler_type = 'sigmoid'
     ratio_scheduler_type = 'learned'
+
+    # ynet_type = 'ynet'
+    ynet_type = 'yheadnet'
 
     push_to_hub = False
     overwrite_output_dir = True
@@ -60,13 +55,7 @@ class evaluation_model:
 
 
 @torch.no_grad()
-def evaluate(
-        config: TrainingConfig,
-        epoch,
-        pipeline: MyDoubleDDPMPipeline,
-        ratio_scheduler: DoubleDenoisingRatioScheduler,
-        cfg_scale = None,
-    ):
+def evaluate(config: TrainingConfig, epoch, pipeline: YNetDDPMPipeline, cfg_scale = None):
     logger = logging.getLogger('Cond_DDPM')
 
     def unnormalize_to_zero_to_one(t):
@@ -79,8 +68,7 @@ def evaluate(
         batch_size=config.eval_batch_size,
         condition=cond,
         generator=torch.cuda.manual_seed(config.seed),
-        cfg_scale=cfg_scale,
-        ratio_scheduler=ratio_scheduler,
+        cfg_scale=cfg_scale
     ).images
 
     # Make a grid out of the images
@@ -89,16 +77,15 @@ def evaluate(
     image_grid = make_grid(images, nrow=10)
 
     # Save the images
-    test_dir = Path(config.output_dir) / "samples"
+    test_dir = os.path.join(config.output_dir, "samples")
 
-    # check ratio
-    if ratio_scheduler.ratio_type == 'learned':
+    if pipeline.ynet.ratio_scheduler.ratio_type == 'learned':
         ratio_dir = Path(config.output_dir) / "ratio"
         ratio_dir.mkdir(parents=True, exist_ok=True)
         fig, ax = plt.subplots()
         fig.set_size_inches(10, 2)
         t = torch.arange(1000)
-        ratio = ratio_scheduler.get_ratio(t.to(config.device), True).squeeze().cpu().numpy()
+        ratio = pipeline.ynet.ratio_scheduler.get_ratio(t.to(config.device), True).squeeze().cpu().numpy()
         t = t.numpy()
         ax.set_ylim(0, 1)
         ax.fill_between(t, 0, ratio, label='expert1')
@@ -108,8 +95,8 @@ def evaluate(
         ax.set_ylabel('Ratio (of expert 1)')
         fig.tight_layout()
         fig.savefig(ratio_dir / f"{epoch:04d}.png")
-        
-    test_dir.mkdir(parents=True, exist_ok=True)
+
+    os.makedirs(test_dir, exist_ok=True)
 
     cfg_prefix = '' if cfg_scale is None else f'cfg{cfg_scale}_'
     save_image(image_grid, f"{test_dir}/{cfg_prefix}{epoch:04d}.png")
@@ -130,7 +117,6 @@ def Train():
 
     preprocess = transforms.Compose(
         [
-            # transforms.Resize((config.image_size, config.image_size)),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
@@ -149,12 +135,34 @@ def Train():
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=True)
-
-    model = DoubleUnet.from_unet_pretrained(config.unet_pretrained, config.unet_pretrained2)
+    
+    model = (YNet2DModel if config.ynet_type == 'ynet' else YHeadNet2DModel)(
+        sample_size=config.image_size,  # the target image resolution
+        block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channels for each UNet block
+        down_block_types=(
+            "DownBlock2D",  # a regular ResNet downsampling block
+            "DownBlock2D",
+            "DownBlock2D",
+            "DownBlock2D",  # a ResNet downsampling block with spatial self-attention
+            "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
+            "DownBlock2D",
+        ),
+        up_block_types=(
+            "UpBlock2D",
+            "AttnUpBlock2D",
+            "UpBlock2D",
+            "UpBlock2D",
+            "UpBlock2D",
+            "UpBlock2D",
+        ),
+        in_channels=3,  # the number of input channels, 3 for RGB images
+        out_channels=3,  # the number of output channels
+        num_class_embeds=10,
+        ratio_scheduler_kwargs={'ratio_type': config.ratio_scheduler_type}
+    )
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule=config.scheduler_type)
-    ratio_scheduler = DoubleDenoisingRatioScheduler(ratio_type=config.ratio_scheduler_type, time_steps=1000)
 
-    optimizer = torch.optim.AdamW(list(model.parameters()) + list(ratio_scheduler.parameters()), lr=config.learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=config.lr_warmup_steps,
@@ -164,9 +172,8 @@ def Train():
 
     def train_loop(
             config: TrainingConfig,
-            model: DoubleUnet,
+            model: YNet2DModel,
             noise_scheduler: DDPMScheduler,
-            ratio_scheduler: DoubleDenoisingRatioScheduler,
             optimizer: torch.optim.AdamW,
             train_dataloader: DataLoader,
             lr_scheduler, writer: SummaryWriter):
@@ -184,8 +191,8 @@ def Train():
         # Prepare everything
         # There is no specific order to remember, you just need to unpack the
         # objects in the same order you gave them to the prepare method.
-        model, optimizer, train_dataloader, lr_scheduler, ratio_scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, lr_scheduler, ratio_scheduler
+        model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            model, optimizer, train_dataloader, lr_scheduler
         )
 
         global_step = 0
@@ -206,7 +213,6 @@ def Train():
                 timesteps = torch.randint(
                     0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device
                 ).long()
-                ratios = ratio_scheduler.get_ratio(t=timesteps, batch=True)
 
                 # Add noise to the clean images according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
@@ -214,7 +220,7 @@ def Train():
 
                 with accelerator.accumulate(model):
                     # Predict the noise residual
-                    noise_pred = model(noisy_images, timesteps, ratio=ratios, class_labels=cond_labels, return_dict=False)[0]
+                    noise_pred = model(noisy_images, timesteps, class_labels=cond_labels, return_dict=False)[0]
                     loss = criterion(noise_pred, noise)
                     accelerator.backward(loss)
                     # if accelerator.sync_gradients:
@@ -237,26 +243,19 @@ def Train():
 
             # After each epoch you optionally sample some demo images with evaluate() and save the model
             if accelerator.is_main_process:
-                if (epoch) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                    unwap_m: DoubleUnet = accelerator.unwrap_model(model)
-                    pipeline = MyDoubleDDPMPipeline(
-                        unet1=unwap_m.expert_unet_1,
-                        unet2=unwap_m.expert_unet_2,
-                        scheduler=noise_scheduler)
-                    evaluate(config, epoch, pipeline, ratio_scheduler)
+                pipeline = YNetDDPMPipeline(ynet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
 
-                if (epoch) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
-                    unwap_m: DoubleUnet = accelerator.unwrap_model(model)
-                    unwap_m.save_pretrained(config.output_dir)
-                    noise_scheduler.save_pretrained(config.output_dir)
-                    torch.save(accelerator.unwrap_model(ratio_scheduler).state_dict(), Path(config.output_dir) / "ratio_scheduler.pt")
+                if (epoch) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
+                    evaluate(config, epoch, pipeline)
+
+                if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
+                    pipeline.save_pretrained(config.output_dir)
                     logger.info(f"Save epoch#{epoch} model to {str(config.output_dir)}")
 
     train_loop(
         config=config, 
         model=model, 
         noise_scheduler=noise_scheduler, 
-        ratio_scheduler=ratio_scheduler,
         optimizer=optimizer, 
         train_dataloader=train_dataloader, 
         lr_scheduler=lr_scheduler, writer=writer)

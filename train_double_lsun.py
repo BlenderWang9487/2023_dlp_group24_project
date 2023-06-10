@@ -1,55 +1,51 @@
 from typing import List, Optional, Tuple, Union
 from dataclasses import dataclass
-from diffusers import DDPMScheduler
+from diffusers import DDPMScheduler, DDIMScheduler
 from torchvision import transforms, datasets
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from diffusers.optimization import get_cosine_schedule_with_warmup
-from model.double_diffusion import DoubleUnet, MyDoubleDDPMPipeline, DoubleDenoisingRatioScheduler
+from model.my_diffusers import MyDDPMPipeline, MyUNet2DConditionModel, MyUNet2DModel, MyConditionedUNet
+from model.double_diffusion import DoubleUnet, DoubleDenoisingRatioScheduler, MyDoubleDDPMPipeline
 import torch
 from torchvision.utils import make_grid, save_image
 
 from accelerate import Accelerator
 from tqdm.auto import tqdm
 from pathlib import Path
+from matplotlib import pyplot as plt
 import os
 import random
 import logging
 import numpy as np
-import matplotlib.pyplot as plt
 
 @dataclass
 class TrainingConfig:
-    image_size = 32
+    image_size = 64
     uncond_prob = 0.0
-    train_batch_size = 128
+    train_batch_size = 32
     eval_batch_size = 100
-    num_epochs = 200
-    # num_epochs = 30
+    class_num = 4
+    num_epochs = 100
     gradient_accumulation_steps = 1
     learning_rate = 1e-4
-    # lr_warmup_steps = 391
     lr_warmup_steps = 500
     save_image_epochs = 5
     save_model_epochs = 10
+    save_image_iter = 5000
+    save_model_iter = 5000
+    log_iter = 1000
+    unet_pretrained = "ckpt/lsun/base_735000/unet"
     mixed_precision = "fp16"
-    # output_dir = "ckpt/cifar10/0602/double"
-    # output_dir = "ckpt/cifar10/0603/double"
-    # output_dir = "ckpt/cifar10/0605/double"
-    # output_dir = "ckpt/cifar10/0606/double_halfsize"
-    output_dir = "ckpt/cifar10/0606/double_halfsize_learned"
-    # unet_pretrained = "ckpt/cifar10/0601/unet"
-    # unet_pretrained = "ckpt/cifar10/init_model"
-    # unet_pretrained2 = "ckpt/cifar10/init_model_2"
-    unet_pretrained = "ckpt/cifar10/half/init_model"
-    unet_pretrained2 = "ckpt/cifar10/half/init_model_2"
+    output_dir = "ckpt/lsun/0610/double"
     num_workers = 4
     device = 'cuda'
     scheduler_type = 'squaredcos_cap_v2'
     # ratio_scheduler_type = 'linear'
     # ratio_scheduler_type = 'sigmoid'
     ratio_scheduler_type = 'learned'
+    start_step = 735000
 
     push_to_hub = False
     overwrite_output_dir = True
@@ -62,7 +58,7 @@ class evaluation_model:
 @torch.no_grad()
 def evaluate(
         config: TrainingConfig,
-        epoch,
+        iteration,
         pipeline: MyDoubleDDPMPipeline,
         ratio_scheduler: DoubleDenoisingRatioScheduler,
         cfg_scale = None,
@@ -72,8 +68,8 @@ def evaluate(
     def unnormalize_to_zero_to_one(t):
         return torch.clamp((t + 1) * 0.5, min=0., max=1.)
 
-    class_labels = np.zeros((100, 10))
-    class_labels[np.arange(100), np.repeat(np.arange(10), 10)] = 1. # 100 images, 10 for each classes
+    class_labels = np.zeros((config.eval_batch_size, config.class_num))
+    class_labels[np.arange(config.eval_batch_size), np.repeat(np.arange(config.class_num), config.eval_batch_size // config.class_num)] = 1. # 100 images, 25 for each classes
     cond = torch.from_numpy(class_labels).to(config.device)
     images = pipeline(
         batch_size=config.eval_batch_size,
@@ -107,12 +103,12 @@ def evaluate(
         ax.set_xlabel('Timestep')
         ax.set_ylabel('Ratio (of expert 1)')
         fig.tight_layout()
-        fig.savefig(ratio_dir / f"{epoch:04d}.png")
+        fig.savefig(ratio_dir / f"{iteration:04d}.png")
         
     test_dir.mkdir(parents=True, exist_ok=True)
 
     cfg_prefix = '' if cfg_scale is None else f'cfg{cfg_scale}_'
-    save_image(image_grid, f"{test_dir}/{cfg_prefix}{epoch:04d}.png")
+    save_image(image_grid, f"{test_dir}/{cfg_prefix}{iteration:04d}.png")
 
 def Train():
     config = TrainingConfig()
@@ -130,19 +126,23 @@ def Train():
 
     preprocess = transforms.Compose(
         [
-            # transforms.Resize((config.image_size, config.image_size)),
+            transforms.Resize((config.image_size, config.image_size)),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
     )
 
-    def to_onehot(y, class_num=10):
+    def to_onehot(y, class_num=config.class_num):
         y_vec = torch.zeros((class_num, ))
         y_vec[y] = 1.
         return y_vec
 
-    data = datasets.CIFAR10(root='dataset/cifar10', transform=preprocess, target_transform=to_onehot, download=True)
+    data = datasets.LSUN(
+        root='/mnt/ssd/blender/lsun', 
+        transform=preprocess, 
+        target_transform=to_onehot, 
+        classes=['church_outdoor_train','classroom_train','conference_room_train','dining_room_train'])
 
     train_dataloader = DataLoader(
         data, batch_size=config.train_batch_size,
@@ -150,7 +150,7 @@ def Train():
         num_workers=config.num_workers,
         pin_memory=True)
 
-    model = DoubleUnet.from_unet_pretrained(config.unet_pretrained, config.unet_pretrained2)
+    model = DoubleUnet.from_unet_pretrained(config.unet_pretrained, ModelType=MyConditionedUNet)
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule=config.scheduler_type)
     ratio_scheduler = DoubleDenoisingRatioScheduler(ratio_type=config.ratio_scheduler_type, time_steps=1000)
 
@@ -188,7 +188,7 @@ def Train():
             model, optimizer, train_dataloader, lr_scheduler, ratio_scheduler
         )
 
-        global_step = 0
+        global_step = config.start_step
         # Now you train the model
         for epoch in range(config.num_epochs):
             progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
@@ -231,26 +231,30 @@ def Train():
                 total_loss += loss.detach().item()
                 progress_bar.set_postfix(**logs)
                 global_step += 1
-            total_loss /= len(train_dataloader)
-            # logger.info(f"{logs}, step={global_step}")
-            logger.info(f"epoch {epoch}, step={global_step}, loss avg={total_loss}")
 
-            # After each epoch you optionally sample some demo images with evaluate() and save the model
-            if accelerator.is_main_process:
-                if (epoch) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                    unwap_m: DoubleUnet = accelerator.unwrap_model(model)
-                    pipeline = MyDoubleDDPMPipeline(
-                        unet1=unwap_m.expert_unet_1,
-                        unet2=unwap_m.expert_unet_2,
-                        scheduler=noise_scheduler)
-                    evaluate(config, epoch, pipeline, ratio_scheduler)
+                # After each epoch you optionally sample some demo images with evaluate() and save the model
+                if accelerator.is_main_process:
+                    if (global_step) % config.save_image_iter == 0 or epoch == config.num_epochs - 1:
+                        unwap_m: DoubleUnet = accelerator.unwrap_model(model)
+                        pipeline = MyDoubleDDPMPipeline(
+                            unet1=unwap_m.expert_unet_1,
+                            unet2=unwap_m.expert_unet_2,
+                            scheduler=DDIMScheduler(num_train_timesteps=1000, beta_schedule=config.scheduler_type))
+                        evaluate(config, global_step, pipeline, ratio_scheduler)
 
-                if (epoch) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
-                    unwap_m: DoubleUnet = accelerator.unwrap_model(model)
-                    unwap_m.save_pretrained(config.output_dir)
-                    noise_scheduler.save_pretrained(config.output_dir)
-                    torch.save(accelerator.unwrap_model(ratio_scheduler).state_dict(), Path(config.output_dir) / "ratio_scheduler.pt")
-                    logger.info(f"Save epoch#{epoch} model to {str(config.output_dir)}")
+                    if (global_step) % config.save_model_iter == 0 or epoch == config.num_epochs - 1:
+                        unwap_m: DoubleUnet = accelerator.unwrap_model(model)
+                        save_dir = Path(config.output_dir) / "weight" / f"{global_step:06d}"
+                        save_dir.mkdir(parents=True, exist_ok=True)
+                        unwap_m.save_pretrained(save_dir)
+                        noise_scheduler.save_pretrained(save_dir)
+                        torch.save(accelerator.unwrap_model(ratio_scheduler).state_dict(), save_dir / "ratio_scheduler.pt")
+                        logger.info(f"Save iter#{global_step} model to {str(save_dir)}")
+            
+                    if global_step % config.log_iter == 0:
+                        total_loss /= config.log_iter
+                        logger.info(f"step={global_step}, loss avg={total_loss}")
+                        total_loss = 0.
 
     train_loop(
         config=config, 
