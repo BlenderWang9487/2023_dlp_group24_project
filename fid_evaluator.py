@@ -34,7 +34,7 @@ def get_args():
     parser.add_argument('--sample_count', type=int, default=10000, help='number of images to sample by model')
     parser.add_argument('--device', type=str, default='cuda', help='device to run model on')
     parser.add_argument('--noise_type', type=str, default='squaredcos_cap_v2', help='noise scheduler')
-    parser.add_argument('--ratio_type', type=str, default='linear', help='ratio scheduler type')
+    parser.add_argument('--ratio_type', type=str, choices=['linear', 'sigmoid', 'learned'], default='linear', help='ratio scheduler type')
     parser.add_argument('--seed', type=int, default=9487, help='seed for reproduction')
     parser.add_argument('--img_size', type=int, default=64, help='size of the images that model was trained on')
     parser.add_argument('--use_ddim', action='store_true', help='use DDIM as scheduler to accelerate sampling speed')
